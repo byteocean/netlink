@@ -25,7 +25,7 @@ const (
 )
 
 func testLinkAddDel(t *testing.T, link Link) {
-	links, err := LinkList()
+	_, err := LinkList()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func testLinkAddDel(t *testing.T, link Link) {
 				if bond.AdUserPortKey != other.AdUserPortKey {
 					t.Fatalf("Got unexpected AdUserPortKey: %d, expected: %d", other.AdUserPortKey, bond.AdUserPortKey)
 				}
-				if bytes.Compare(bond.AdActorSystem, other.AdActorSystem) != 0 {
+				if !bytes.Equal(bond.AdActorSystem, other.AdActorSystem) {
 					t.Fatalf("Got unexpected AdActorSystem: %d, expected: %d", other.AdActorSystem, bond.AdActorSystem)
 				}
 			case "balance-tlb":
@@ -287,11 +287,19 @@ func testLinkAddDel(t *testing.T, link Link) {
 		compareTuntap(t, tuntap, other)
 	}
 
+	if bareudp, ok := link.(*BareUDP); ok {
+		other, ok := result.(*BareUDP)
+		if !ok {
+			t.Fatal("Result of create is not a BareUDP")
+		}
+		compareBareUDP(t, bareudp, other)
+	}
+
 	if err = LinkDel(link); err != nil {
 		t.Fatal(err)
 	}
 
-	links, err = LinkList()
+	links, err := LinkList()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,6 +556,28 @@ func compareTuntap(t *testing.T, expected, actual *Tuntap) {
 	}
 }
 
+func compareBareUDP(t *testing.T, expected, actual *BareUDP) {
+	// set the Port to 6635 (the linux default) if it wasn't specified at creation
+	if expected.Port == 0 {
+		expected.Port = 6635
+	}
+	if actual.Port != expected.Port {
+		t.Fatalf("BareUDP.Port doesn't match: %d %d", actual.Port, expected.Port)
+	}
+
+	if actual.EtherType != expected.EtherType {
+		t.Fatalf("BareUDP.EtherType doesn't match: %x %x", actual.EtherType, expected.EtherType)
+	}
+
+	if actual.SrcPortMin != expected.SrcPortMin {
+		t.Fatalf("BareUDP.SrcPortMin doesn't match: %d %d", actual.SrcPortMin, expected.SrcPortMin)
+	}
+
+	if actual.MultiProto != expected.MultiProto {
+		t.Fatal("BareUDP.MultiProto doesn't match")
+	}
+}
+
 func TestLinkAddDelWithIndex(t *testing.T) {
 	tearDown := setUpNetlinkTest(t)
 	defer tearDown()
@@ -585,7 +615,7 @@ func TestLinkModify(t *testing.T) {
 	}
 
 	link.MTU = updatedMTU
-	if err := pkgHandle.LinkModify(link); err != nil {
+	if err := LinkModify(link); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1386,6 +1416,69 @@ func TestLinkAddDelVxlanFlowBased(t *testing.T) {
 	testLinkAddDel(t, &vxlan)
 }
 
+func TestLinkAddDelBareUDP(t *testing.T) {
+	minKernelRequired(t, 5, 8)
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+
+	testLinkAddDel(t, &BareUDP{
+		LinkAttrs:  LinkAttrs{Name: "foo99"},
+		Port:       6635,
+		EtherType:  syscall.ETH_P_MPLS_UC,
+		SrcPortMin: 12345,
+		MultiProto: true,
+	})
+
+	testLinkAddDel(t, &BareUDP{
+		LinkAttrs:  LinkAttrs{Name: "foo100"},
+		Port:       6635,
+		EtherType:  syscall.ETH_P_IP,
+		SrcPortMin: 12345,
+		MultiProto: true,
+	})
+}
+
+func TestBareUDPCompareToIP(t *testing.T) {
+	// requires iproute2 >= 5.10
+	minKernelRequired(t, 5, 9)
+	ns, tearDown := setUpNamedNetlinkTest(t)
+	defer tearDown()
+
+	expected := &BareUDP{
+		Port:       uint16(6635),
+		EtherType:  syscall.ETH_P_MPLS_UC,
+		SrcPortMin: 12345,
+		MultiProto: true,
+	}
+
+	// Create interface
+	cmd := exec.Command("ip", "netns", "exec", ns,
+		"ip", "link", "add", "b0",
+		"type", "bareudp",
+		"dstport", fmt.Sprint(expected.Port),
+		"ethertype", "mpls_uc",
+		"srcportmin", fmt.Sprint(expected.SrcPortMin),
+		"multiproto",
+	)
+	out := &bytes.Buffer{}
+	cmd.Stdout = out
+	cmd.Stderr = out
+
+	if rc := cmd.Run(); rc != nil {
+		t.Fatal("failed creating link:", rc, out.String())
+	}
+
+	link, err := LinkByName("b0")
+	if err != nil {
+		t.Fatal("Failed getting link: ", err)
+	}
+	actual, ok := link.(*BareUDP)
+	if !ok {
+		t.Fatalf("resulted interface is not BareUDP: %T", link)
+	}
+	compareBareUDP(t, expected, actual)
+}
+
 func TestLinkAddDelIPVlanL2(t *testing.T) {
 	minKernelRequired(t, 4, 2)
 	tearDown := setUpNetlinkTest(t)
@@ -1737,7 +1830,7 @@ func TestLinkSubscribeAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer nh.Delete()
+	defer nh.Close()
 
 	// Subscribe for Link events on the custom netns
 	ch := make(chan LinkUpdate)
@@ -1787,7 +1880,7 @@ func TestLinkSubscribeListExisting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer nh.Delete()
+	defer nh.Close()
 
 	link := &Veth{LinkAttrs{Name: "test", TxQLen: testTxQLen, MTU: 1400}, "bar", nil, nil}
 	if err := nh.LinkAdd(link); err != nil {
@@ -2660,6 +2753,56 @@ func TestLinkSetAllmulticast(t *testing.T) {
 
 	if link.Attrs().Allmulti != 0 {
 		t.Fatal("IFF_ALLMULTI is still set")
+	}
+}
+
+func TestLinkSetMulticast(t *testing.T) {
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+
+	iface := &Veth{LinkAttrs: LinkAttrs{Name: "foo"}, PeerName: "bar"}
+	if err := LinkAdd(iface); err != nil {
+		t.Fatal(err)
+	}
+
+	link, err := LinkByName("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+
+	link, err = LinkByName("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := LinkSetMulticastOn(link); err != nil {
+		t.Fatal(err)
+	}
+
+	link, err = LinkByName("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if link.Attrs().Multi != 1 {
+		t.Fatal("IFF_MULTICAST was not set")
+	}
+
+	if err := LinkSetMulticastOff(link); err != nil {
+		t.Fatal(err)
+	}
+
+	link, err = LinkByName("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if link.Attrs().Multi != 0 {
+		t.Fatal("IFF_MULTICAST is still set")
 	}
 }
 
